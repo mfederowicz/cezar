@@ -7,13 +7,13 @@ import {
   SquareIcon,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { useParams, useSearchParams } from 'react-router'
+import { Link as GlobalLink, useParams, useSearchParams } from 'react-router'
 
 import { Link, useNavigate } from '@/lib/project-router'
 
 import { createRun, getLaunchKey, putConfig, putUiState } from '@/api/client'
 import { useProjectScope } from '@/api/project-scope-context'
-import { hasAccountChoice, useAgentAccounts } from '@/api/agent-accounts'
+import { hasAccountChoice, useAgentAccounts, useSelectedAccountCheck } from '@/api/agent-accounts'
 import {
   queryKeys,
   useConfig,
@@ -28,7 +28,7 @@ import {
   useWorkflows,
 } from '@/api/queries'
 import type {
-  AttachmentInput,
+  AttachmentEntry,
   DispatchIntent,
   ProjectListEntry,
   RepoResponse,
@@ -93,6 +93,7 @@ import {
   type TaskSource,
 } from './new-task-form'
 import { parseNewTaskParams } from './new-task-params'
+import { trackMessageSent } from '@/lib/telemetry'
 
 /**
  * `/new` — the full-screen new-task hero (spec §"New task (full-screen, #386)"; visual
@@ -253,6 +254,8 @@ export function NewTaskRoute() {
   )
     ? draft.agentProfile
     : null
+  // The account this task will actually run on — what the server's gate judges (ac53a6ef).
+  const accountCheck = useSelectedAccountCheck(displayRunner, agentProfile ?? repoAccount?.[displayRunner])
 
   // A cold /new load mounts the textarea disabled while provider status is checked. Restore
   // the route's autofocus contract once that check enables the form, but never steal focus if
@@ -412,6 +415,7 @@ export function NewTaskRoute() {
       if (launchKey !== '' && deepLink.key === launchKey) {
         try {
           const created = await createRun(bookmarkletRunBody(deepLink, runner, defaultRunner))
+          trackMessageSent('bookmarklet')
           clearStartedDraft(draftProjectId)
           void queryClient.invalidateQueries({ queryKey: queryKeys.runs.all })
           void navigate(startedRunPath(created))
@@ -454,7 +458,7 @@ export function NewTaskRoute() {
       ?.focus()
   }, [notice, sourcesReady]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const submit = async (text: string, submitted: AttachmentInput[]) => {
+  const submit = async (text: string, submitted: AttachmentEntry[]) => {
     if (!providersReady || runner === null) {
       throw new Error(
         providers.isPending
@@ -463,6 +467,10 @@ export function NewTaskRoute() {
             ? 'Provider authentication could not be verified.'
             : 'Connect an agent provider before starting a task.',
       )
+    }
+    if (accountCheck.blocked !== null) {
+      const blocked = await accountCheck.verify()
+      if (blocked !== null) throw new Error(blocked)
     }
     if (!sourcesReady) {
       // Rejection restores the draft — nothing typed is lost to a race with the pickers.
@@ -492,6 +500,7 @@ export function NewTaskRoute() {
         dispatch,
       }),
     )
+    trackMessageSent('new_task')
     // Remember what was actually run so the next visit preselects it (legacy
     // `saveLastTaskSource`) and float it to the top of the picker next time
     // (recency sort) — fire-and-forget: a failed write only costs the convenience.
@@ -759,6 +768,23 @@ export function NewTaskRoute() {
             </>
           }
         />
+
+        {accountCheck.blocked !== null ? (
+          <p
+            data-slot="account-signed-out"
+            role="alert"
+            className="mt-2 rounded-md border border-destructive/30 bg-destructive/[0.07] px-3 py-1.5 text-xs text-muted-foreground"
+          >
+            {accountCheck.blocked}{' '}
+            {/* Global settings sit outside every project scope — react-router's own Link. */}
+            <GlobalLink
+              to="/settings/global/accounts"
+              className="font-medium text-foreground underline underline-offset-2"
+            >
+              Agent accounts
+            </GlobalLink>
+          </p>
+        ) : null}
 
         {dispatchOn && (dispatchSettingsOpen || dispatchHintFlash) ? (
           <p
