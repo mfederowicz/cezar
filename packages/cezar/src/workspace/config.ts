@@ -1,8 +1,9 @@
 import { randomBytes } from 'node:crypto';
-import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
+import { renameSyncWithRetry } from '../fs-rename.ts';
 // Contract VALUES, like `workspaceUiStateSchema` in workspace/migrations.ts: the tag bounds this
 // file must not `.catch` away are the same constants the PATCH route validates against, so they
 // are imported rather than repeated.
@@ -187,6 +188,11 @@ const disabledProvidersSchema = z
     return PROVIDER_IDS.filter((provider) => seen.has(provider));
   });
 
+const MAX_ORG_SKILLS_REPOS = 20;
+const orgSkillsRepoSchema = z
+  .object({ repo: z.string().min(1).max(500), ref: z.string().min(1).max(200).default('main') })
+  .passthrough();
+
 const workspaceConfigSchema = z
   .object({
     /** Optional instance name shown in the cockpit; absent keeps the product default. */
@@ -206,6 +212,23 @@ const workspaceConfigSchema = z
     /** Optional auto-update override. Absence inherits the environment/default
      *  and must stay absent on unrelated merge-writes. */
     skillsAutoUpdate: z.boolean().optional().catch(undefined),
+    /** The user's own skills repos (e.g. an organisation's), merged into every project's team
+     *  skills after the project's own `skillsRepos`. Absent = none. */
+    orgSkillsRepos: z
+      .array(z.unknown())
+      .optional()
+      .catch(undefined)
+      // Same bounds as the PUT schema, applied per entry so one bad row never evicts the rest.
+      .transform((entries) =>
+        entries === undefined
+          ? undefined
+          : entries
+              .flatMap((entry) => {
+                const parsed = orgSkillsRepoSchema.safeParse(entry);
+                return parsed.success ? [parsed.data] : [];
+              })
+              .slice(0, MAX_ORG_SKILLS_REPOS),
+      ),
     /** Release channel the self-updater follows (`stable` → npm `latest`, `nightly` → `nightly`,
      *  `development` → none: a worktree or PR preview picked by hand). Absent inherits
      *  `CEZ_UPDATE_CHANNEL`, then stable. */
@@ -397,7 +420,7 @@ export function atomicWriteJsonSync(path: string, value: unknown): void {
     fsyncSync(fd);
     closeSync(fd);
     fd = -1;
-    renameSync(tmp, path);
+    renameSyncWithRetry(tmp, path);
   } catch (error) {
     if (fd !== -1) {
       try {

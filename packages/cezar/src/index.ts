@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
 import { spawn, execFileSync } from 'node:child_process';
-import { createServer } from 'node:net';
 import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,6 +33,8 @@ import {
 } from './server/provider-action-gate.ts';
 import { printSkillsBanner, printStarBanner } from './skills-banner.ts';
 import { SelfUpdateService } from './self-update/service.ts';
+import { runsFromCheckout } from './self-update/layout.ts';
+import { devVersion } from './self-update/semver.ts';
 import { isSupervised, restartProcess } from './self-update/restart.ts';
 import { runSelfUpdateCommand } from './self-update/cli.ts';
 import { writeLaunchers } from './self-update/launcher.ts';
@@ -44,6 +45,7 @@ import { WorkspaceSemaphore } from './workspace/semaphore.ts';
 import { flushTelemetry, initTelemetry, installCrashReporter, registerTelemetryContext, startDailyPing, track } from './telemetry.ts';
 import { runTaskCommand } from './dispatch/task-cli.ts';
 import { runAutomationCommand } from './automations/automation-cli.ts';
+import { apiOrigin, pickPort } from './api-origin.ts';
 import { runTelemetryCommand } from './telemetry-cli.ts';
 import { reportInconclusiveProbe } from './server/provider-telemetry.ts';
 import { runRunsCommand } from './runs/runs-cli.ts';
@@ -294,9 +296,11 @@ async function serveCommand(
   const providerRuntimeAuth = new ProviderRuntimeAuthObserver(providerAuth, (status) => {
     workspaceEvents.emit('provider-status', status);
   });
-  const version = readOwnVersion();
+  // Shown on health and the banner; update checks compare the raw version.
+  const version = shownVersion();
   // Opt-in telemetry: every send below is a no-op until the user agreed (docs/telemetry.md).
-  await initTelemetry({ version });
+  // It gets the raw version (`build.version_full`) and derives `-dev` itself.
+  await initTelemetry({ version: readOwnVersion() });
   installCrashReporter();
   track('app_start');
   startDailyPing();
@@ -332,15 +336,14 @@ async function serveCommand(
   );
   if (recovered > 0) console.log(`  recovered ${recovered} run(s) from the previous session`);
 
-  const port = await pickPort(preferredPort);
-
   // Update discovery (#368) through the self-update service (PoC): the channel's newest
   // version lands on /api/v1/health as `latestVersion` for the chip, and the dialog behind the
   // chip can apply it when this cezar runs from the managed layout (`cezar install`).
   const pkgName = readOwnName();
   const update: { latest?: string } = {};
   const selfUpdate = buildSelfUpdateService({
-    activeRuns: () => store.listRuns().filter((r) => ['queued', 'waiting', 'running'].includes(r.status)).length,
+    // Workspace-wide, every project's manager — not the boot repo's store (#1524).
+    runs: semaphore,
     // The server's own predicate, not a second spelling of it: the `/apply` guard decides hosted
     // mode through `resolveCapabilities`, and the two must never disagree (they did, on 127.0.0.2).
     trimPaths: () => !resolveCapabilities(process.env, bindHost).localHandoff,
@@ -377,6 +380,7 @@ async function serveCommand(
       'runs.total': runs.length,
     };
   });
+  const port = await pickPort(preferredPort, bindHost);
   // SECURITY: cezar executes agents. A non-loopback bind exposes that box to
   // whatever can reach the interface, and cezar itself has NO auth — it is only
   // for a deliberate hosted setup where a reverse proxy in front provides TLS +
@@ -390,7 +394,7 @@ async function serveCommand(
   }
   // Where a dispatched agent's `cez task` CLI reaches this cockpit (spec 2026-09-10-dispatch).
   // Set before the first run can start, read by every manager's `agentEnv` while dispatch is on.
-  process.env.CEZ_API_URL = `http://127.0.0.1:${port}`;
+  process.env.CEZ_API_URL = apiOrigin(bindHost, port);
   process.env.CEZ_BIN = resolve(process.argv[1] ?? fileURLToPath(import.meta.url));
   httpServer = startServer({
     repoRoot,
@@ -477,23 +481,6 @@ async function serveCommand(
     const healthy = await waitForHealth(`${url}/api/v1/health`, 5_000);
     if (healthy) openUrl(url);
   }
-}
-
-/** First free port starting at `start` (the launch.mjs pattern from janitor). */
-async function pickPort(start: number): Promise<number> {
-  for (let port = start; port < start + 50; port++) {
-    if (await canListen(port)) return port;
-  }
-  return start; // let the server fail loudly if 50 ports are somehow busy
-}
-
-function canListen(port: number): Promise<boolean> {
-  return new Promise((resolvePort) => {
-    const probe = createServer();
-    probe.once('error', () => resolvePort(false));
-    probe.once('listening', () => probe.close(() => resolvePort(true)));
-    probe.listen(port, '127.0.0.1');
-  });
 }
 
 async function waitForHealth(healthUrl: string, timeoutMs: number): Promise<boolean> {
@@ -869,13 +856,14 @@ function openStore(repoRoot: string, opts?: { keepLive?: boolean }): RunStore {
 
 /** The self-update service over THIS process: its package, version and entry file. */
 function buildSelfUpdateService(
-  overrides: Partial<Pick<ConstructorParameters<typeof SelfUpdateService>[0], 'restart' | 'activeRuns' | 'trimPaths'>> & {
+  overrides: Partial<Pick<ConstructorParameters<typeof SelfUpdateService>[0], 'restart' | 'runs' | 'trimPaths'>> & {
     restart: () => void;
   },
 ): SelfUpdateService {
   return new SelfUpdateService({
     pkgName: readOwnName(),
     version: readOwnVersion(),
+    displayVersion: shownVersion(),
     entry: resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
     supervised: isSupervised(),
     ...overrides,
@@ -891,6 +879,12 @@ function readOwnName(): string {
   } catch {
     return '@open-mercato/cezar';
   }
+}
+
+/** The running version as shown: `-dev` when the code is a source checkout, linked or not. */
+function shownVersion(): string {
+  const version = readOwnVersion();
+  return runsFromCheckout(resolve(process.argv[1] ?? fileURLToPath(import.meta.url))) ? devVersion(version) : version;
 }
 
 function readOwnVersion(): string {

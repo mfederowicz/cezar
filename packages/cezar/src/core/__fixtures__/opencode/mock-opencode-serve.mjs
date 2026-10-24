@@ -20,12 +20,20 @@
 //                 a server whose turn boundary the runner has to synthesize.
 //   `#drop-then-die` destroy the message POST's socket AND then close the event
 //                 bus: the drop was real, and the runner has to say so.
+//   `#retry-limit` hold the POST open and report a `session.status` retry with a
+//                 spent-quota `action` and `next` hours away (`MOCK_RETRY_NEXT` pins it),
+//                 as a spent free tier does. `MOCK_RETRY_STATUS` (JSON) replaces the status
+//                 and `MOCK_RETRY_SESSION` the session it is reported for.
+//   `#retry-soon` report a retry due in 1 s with no `action`, then finish normally.
 //   `#permission <path>` ask `external_directory` for <path> and, like the
 //                 real server, finish the turn only once the prompt is answered;
 //                 the final text names the reply.
 // `MOCK_LEGACY_PERMISSION=1` serves only the pre-rework session-scoped reply route.
 // `MOCK_NO_EVENT_BUS=1` in the environment makes `GET /event` 404 instead, for
 // the no-event-bus fallback.
+// `MOCK_START=silent` never prints the URL line; `MOCK_START=stderr` prints it on
+// stderr. `MOCK_PATH_DIR` overrides the `directory` `GET /path` reports.
+// `MOCK_API=v2` answers every non-`/api/` POST with 405, as OpenCode 2.x does.
 import { createServer } from 'node:http';
 
 const args = process.argv.slice(2);
@@ -68,6 +76,11 @@ const info = (extra) => ({
 
 const server = createServer((req, res) => {
   const url = req.url ?? '';
+  if (req.method === 'GET' && url === '/path') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ directory: process.env.MOCK_PATH_DIR ?? process.cwd() }));
+    return;
+  }
   if (req.method === 'GET' && url.startsWith('/event')) {
     if (process.env.MOCK_NO_EVENT_BUS === '1') {
       res.writeHead(404, { 'content-type': 'text/plain' });
@@ -82,6 +95,12 @@ const server = createServer((req, res) => {
   let body = '';
   req.on('data', (chunk) => (body += chunk));
   req.on('end', () => {
+    // OpenCode 2.x serves its API under `/api` and answers the 1.x routes with 405.
+    if (process.env.MOCK_API === 'v2' && !url.startsWith('/api/')) {
+      res.writeHead(405);
+      res.end();
+      return;
+    }
     if (req.method === 'POST' && url === '/session') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ id: SESSION_ID, title: 'cezar task' }));
@@ -164,6 +183,21 @@ const server = createServer((req, res) => {
         res.end(JSON.stringify({ info: info({}), parts: [] }));
         return;
       }
+
+      const retryStatus = (extra) =>
+        send({
+          type: 'session.status',
+          properties: { sessionID: process.env.MOCK_RETRY_SESSION ?? SESSION_ID, status: { type: 'retry', attempt: 1, ...extra } },
+        });
+      if (promptText.includes('#retry-limit')) {
+        retryStatus(process.env.MOCK_RETRY_STATUS ? JSON.parse(process.env.MOCK_RETRY_STATUS) : {
+          message: 'Free usage exceeded, subscribe to Go',
+          action: { reason: 'free_tier_limit', provider: 'opencode', title: 'Free limit reached', message: 'Subscribe', label: 'subscribe' },
+          next: Number(process.env.MOCK_RETRY_NEXT) || Date.now() + 3 * 60 * 60_000,
+        });
+        return; // the POST stays open, like the real server's retry loop
+      }
+      if (promptText.includes('#retry-soon')) retryStatus({ message: 'Overloaded', next: Date.now() + 1_000 });
 
       // The other half of the #897 shape: the POST drops AND the session is
       // really gone. Swallowing the drop must not swallow this.
@@ -299,6 +333,8 @@ const server = createServer((req, res) => {
 
 server.listen(port, hostname, () => {
   // The runner reads the bound URL back from stdout, like the real server.
-  console.log(`opencode server listening on http://${hostname}:${server.address().port}`);
+  const line = `opencode server listening on http://${hostname}:${server.address().port}`;
+  if (process.env.MOCK_START === 'stderr') console.error(line);
+  else if (process.env.MOCK_START !== 'silent') console.log(line);
 });
 process.on('SIGTERM', () => process.exit(0));
