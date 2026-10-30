@@ -38,6 +38,7 @@ export const TELEMETRY_ROUTE_SEGMENTS: readonly string[] = [
   'dashboard', 'settings', 'global', 'agents', 'agent-config', 'worktrees', 'bookmarklets',
   'prompt-templates', 'appearance', 'notifications', 'resources', 'accounts', 'projects',
   'keyboard', 'graph', 'integrations', 'secrets', 'workflows-new', 'workspace-secrets', 'privacy',
+  'instructions', 'global-instructions',
 ];
 
 export const telemetryRouteSchema = z
@@ -216,5 +217,7 @@ export const telemetryEventInputSchema = z.discriminatedUnion('event', [
   z.object({ event: z.literal('start_option_picked'), label: z.enum(START_OPTIONS) }),
   /** A task was scheduled from the composer, by the kind of start it waits for. */
   z.object({ event: z.literal('task_scheduled'), label: z.enum(['at', 'usage_reset']) }),
+  /** Design Mode was switched on in a task's Preview — by its button or by ⌥D. */
+  z.object({ event: z.literal('design_mode_enabled'), label: z.enum(['button', 'shortcut']) }),
 ]);
 export type TelemetryEventInput = z.infer<typeof telemetryEventInputSchema>;
